@@ -22,7 +22,7 @@ from px4_msgs.msg import (
 
 from mavsdk import System
 from mavsdk.mission import MissionItem, MissionPlan
-
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
 app = FastAPI()
 
@@ -35,8 +35,8 @@ system_processes = []
 ANDROID_QGC_IP = "172.20.10.3"
 
 # Real drone specs — populated at startup from PX4
-DRONE_SPEED_M_S    = 3.0     # fallback until PX4 responds
-DRONE_POWER_DRAW_W = 1000.0  # fallback until battery telemetry available
+DRONE_SPEED_M_S    = 3.0
+DRONE_POWER_DRAW_W = 7.5
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PYDANTIC MODELS
@@ -78,6 +78,7 @@ class StartMissionRequest(BaseModel):
 class MissionBridge(Node):
     def __init__(self):
         super().__init__("mission_bridge_api")
+        self._initial_battery_pct = 100.0
 
         self.current_position = {
             "x": 0.0,
@@ -92,24 +93,49 @@ class MissionBridge(Node):
             10,
         )
 
+        qos_profile = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+
         self.position_subscriber = self.create_subscription(
             VehicleLocalPosition,
             "/fmu/out/vehicle_local_position_v1",
             self.position_callback,
-            10,
+            qos_profile,
         )
 
         self.battery_subscriber = self.create_subscription(
             BatteryStatus,
             "/fmu/out/battery_status_v1",
             self.battery_callback,
-            10,
+            qos_profile,
         )
 
-        self.power_draw_w       = 0.0
-        self.energy_consumed_wh = 0.0
-        self._last_battery_time = None
-        self._tracking_energy   = False
+        self.vehicle_status_subscriber = self.create_subscription(
+            VehicleStatus,
+            "/fmu/out/vehicle_status_v1",
+            self.vehicle_status_callback,
+            qos_profile,
+        )
+
+        self.power_draw_w        = 0.0
+        self.energy_consumed_wh  = 0.0
+        self._last_battery_time  = None
+        self._tracking_energy    = False
+        self.is_landed           = True
+        self._mission_ended      = False
+        self._final_energy_wh    = 0.0
+        self._final_duration_min = 0
+        self._active_mission_id  = None
+        self.battery_remaining_pct = 100.0
+        self._max_altitude         = 0.0
+        self._altitude_sum         = 0.0
+        self._altitude_count       = 0
+        self._avg_altitude         = 0.0
+        self._flight_start_time  = None  # set on arm, not on API call
 
     def publish_mission(self, start_x, start_y, end_x, end_y):
         msg = PoseArray()
@@ -136,13 +162,45 @@ class MissionBridge(Node):
             "z": float(msg.z),
             "available": True,
         }
+        # Track altitude when mission is flying (NED: z negative = above ground)
+        if self._tracking_energy:
+            alt = abs(float(msg.z))
+            if alt > self._max_altitude:
+                self._max_altitude = alt
+            self._altitude_sum   += alt
+            self._altitude_count += 1
+
+    def vehicle_status_callback(self, msg):
+        # arming_state: 1 = disarmed, 2 = armed
+        just_armed = (
+            self.is_landed == True and
+            msg.arming_state == 2
+        )
+
+        just_landed = (
+            self.is_landed == False and
+            msg.arming_state == 1
+        )
+
+        self.is_landed = (msg.arming_state == 1)
+
+        if just_armed and self._tracking_energy:
+            self._flight_start_time = time.time()
+            self.get_logger().info("Drone armed — flight timer started")
+
+        if just_landed and self._tracking_energy:
+            self.get_logger().info("Landing detected — stopping energy tracking")
+            self.stop_energy_tracking()
+            self._mission_ended = True
 
     def battery_callback(self, msg):
         now     = time.time()
         voltage = float(msg.voltage_v)
-        current = float(msg.current_a)
+        current = abs(float(msg.current_a))  # abs() — PX4 discharge is negative
 
         self.power_draw_w = voltage * current
+
+        self.battery_remaining_pct = float(getattr(msg, 'remaining', 1.0)) * 100
 
         if self._tracking_energy and self._last_battery_time is not None:
             dt_hours = (now - self._last_battery_time) / 3600.0
@@ -151,24 +209,53 @@ class MissionBridge(Node):
         self._last_battery_time = now
 
     def start_energy_tracking(self):
-        self.energy_consumed_wh = 0.0
-        self._last_battery_time = time.time()
-        self._tracking_energy   = True
+        self.energy_consumed_wh  = 0.0
+        self._last_battery_time  = time.time()
+        self._tracking_energy    = True
+        self._mission_ended      = False
+        self._final_energy_wh    = 0.0
+        self._max_altitude         = 0.0
+        self._altitude_sum         = 0.0
+        self._altitude_count       = 0
+        self._avg_altitude         = 0.0
+        self.battery_remaining_pct = 100.0
+        self._final_duration_min = 0.0
+        self._flight_start_time  = None  # reset — will be set on arm
+        self._initial_battery_pct = self.battery_remaining_pct
         self.get_logger().info("Energy tracking started")
 
+
     def stop_energy_tracking(self) -> float:
-        self._tracking_energy = False
-        self.get_logger().info(
-            f"Energy tracking stopped: {self.energy_consumed_wh:.2f} Wh")
-        return self.energy_consumed_wh
+       self._tracking_energy = False
+       self._final_energy_wh = self.energy_consumed_wh
 
+    # Battery used = change from start to end (not absolute from 100%)
+       self._battery_used_pct = max(
+           0.0,
+           self._initial_battery_pct - self.battery_remaining_pct
+       )
 
+       if self._flight_start_time is not None:
+           elapsed_s = time.time() - self._flight_start_time
+           self._final_duration_min = round(elapsed_s / 60, 2)
+       else:
+           self._final_duration_min = 0.0
+
+       self._avg_altitude = (
+           self._altitude_sum / self._altitude_count
+           if self._altitude_count > 0 else 0.0
+       )
+
+       self.get_logger().info(
+           f"Flight ended: {self.energy_consumed_wh:.2f} Wh, "
+           f"{self._final_duration_min} min, "
+           f"battery used: {self._battery_used_pct:.1f}%")
+       return self.energy_consumed_wh
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def get_cruise_speed() -> float:
-    """Reads MPC_XY_CRUISE from PX4 — the actual configured cruise speed."""
     try:
         drone = System()
         await drone.connect(system_address="udp://:14540")
@@ -225,7 +312,7 @@ def generate_coverage_path(start_x, start_y, end_x, end_y, row_spacing=5.0):
         current_y += row_spacing
         left_to_right = not left_to_right
 
-    path.append({"x": start_x, "y": start_y})
+
     return path
 
 
@@ -406,12 +493,12 @@ def create_mission(mission: MissionCreate):
     next_mission_id += 1
 
     missions[mission_id] = {
-        "id": mission_id,
+        "id":      mission_id,
         "start_x": mission.start_x,
         "start_y": mission.start_y,
-        "end_x": mission.end_x,
-        "end_y": mission.end_y,
-        "status": "saved",
+        "end_x":   mission.end_x,
+        "end_y":   mission.end_y,
+        "status":  "saved",
     }
 
     mission_paths[mission_id] = generate_coverage_path(
@@ -420,10 +507,10 @@ def create_mission(mission: MissionCreate):
     )
 
     return {
-        "message": "Mission saved successfully",
+        "message":    "Mission saved successfully",
         "mission_id": mission_id,
-        "mission": missions[mission_id],
-        "path": mission_paths[mission_id],
+        "mission":    missions[mission_id],
+        "path":       mission_paths[mission_id],
     }
 
 
@@ -438,7 +525,7 @@ def get_mission(mission_id: int):
         raise HTTPException(status_code=404, detail="Mission not found")
     return {
         "mission": missions[mission_id],
-        "path": mission_paths.get(mission_id, []),
+        "path":    mission_paths.get(mission_id, []),
     }
 
 
@@ -448,7 +535,7 @@ def get_mission_path(mission_id: int):
         raise HTTPException(status_code=404, detail="Mission not found")
     return {
         "mission_id": mission_id,
-        "path": mission_paths.get(mission_id, []),
+        "path":       mission_paths.get(mission_id, []),
     }
 
 
@@ -474,7 +561,6 @@ def split_mission(mission_id: int, request: SplitMissionRequest):
 
     for i, sub in enumerate(request.sub_missions):
 
-        # Step 3a: checkValidity
         if not check_validity(
             request.main_start_x, request.main_start_y,
             request.main_end_x,   request.main_end_y,
@@ -493,9 +579,9 @@ def split_mission(mission_id: int, request: SplitMissionRequest):
             sub.end_x,   sub.end_y,
         )
 
-        distance_m  = _calculate_path_distance(path)
-        duration_s  = distance_m / DRONE_SPEED_M_S
-        energy_wh   = (duration_s / 3600) * DRONE_POWER_DRAW_W
+        distance_m = _calculate_path_distance(path)
+        duration_s = distance_m / DRONE_SPEED_M_S
+        energy_wh  = (duration_s / 3600) * DRONE_POWER_DRAW_W
 
         missions[sub_key] = {
             "id":                        sub_key,
@@ -507,8 +593,8 @@ def split_mission(mission_id: int, request: SplitMissionRequest):
             "end_y":                     sub.end_y,
             "status":                    "saved",
             "total_distance":            round(distance_m, 2),
-            "estimated_flight_duration": int(duration_s / 60),
-            "energy_consumption":        round(energy_wh, 1),
+            "estimated_flight_duration": round(duration_s / 60, 2),
+            "energy_consumption":        round(energy_wh, 2),
         }
         mission_paths[sub_key] = path
 
@@ -521,8 +607,8 @@ def split_mission(mission_id: int, request: SplitMissionRequest):
             "end_y":                     sub.end_y,
             "path":                      path,
             "total_distance":            round(distance_m, 2),
-            "estimated_flight_duration": int(duration_s / 60),
-            "energy_consumption":        round(energy_wh, 1),
+            "estimated_flight_duration": round(duration_s / 60, 2),
+            "energy_consumption":        round(energy_wh, 2),
         })
 
     missions[mission_id]["sub_missions"] = [
@@ -539,18 +625,24 @@ def split_mission(mission_id: int, request: SplitMissionRequest):
 @app.post("/missions/{mission_id}/register")
 def register_mission(mission_id: int, mission_data: StartMissionRequest):
     if mission_id not in missions:
-        missions[mission_id] = {
-            "id":      mission_id,
-            "start_x": mission_data.start_x,
-            "start_y": mission_data.start_y,
-            "end_x":   mission_data.end_x,
-            "end_y":   mission_data.end_y,
-            "status":  "registered",
-        }
-        mission_paths[mission_id] = generate_coverage_path(
+        # Generate path and calculate distance so energy endpoint has it
+        path       = generate_coverage_path(
             mission_data.start_x, mission_data.start_y,
             mission_data.end_x,   mission_data.end_y,
         )
+        distance_m = _calculate_path_distance(path)
+
+        missions[mission_id] = {
+            "id":             mission_id,
+            "start_x":        mission_data.start_x,
+            "start_y":        mission_data.start_y,
+            "end_x":          mission_data.end_x,
+            "end_y":          mission_data.end_y,
+            "status":         "registered",
+            "total_distance": round(distance_m, 2),  # ← now available
+        }
+        mission_paths[mission_id] = path
+
     return {"message": "Mission registered", "mission_id": mission_id}
 
 
@@ -613,8 +705,8 @@ def start_mission(mission_id: int, mission_data: Optional[StartMissionRequest] =
 
     mission = missions[mission_id]
 
+    # Start tracking — flight timer begins on arm (inside vehicle_status_callback)
     bridge_node.start_energy_tracking()
-    missions[mission_id]["flight_start_time"] = time.time()
 
     bridge_node.publish_mission(
         mission["start_x"],
@@ -649,23 +741,44 @@ def get_mission_energy(mission_id: int):
     if bridge_node is None:
         raise HTTPException(status_code=500, detail="ROS bridge not initialized")
 
-    energy_wh = bridge_node.stop_energy_tracking()
+    # Force stop if still tracking but drone is on the ground
+    if bridge_node._tracking_energy:
+        z = bridge_node.current_position.get("z", 0.0)
+        if abs(z) < 0.5:
+            bridge_node.stop_energy_tracking()
+            bridge_node._mission_ended = True
+        else:
+            return {
+                "mission_id":         mission_id,
+                "status":             "in_flight",
+                "energy_consumed_wh": 0.0,
+                "real_duration_min":  0,
+                "message":            "Mission still in flight",
+            }
 
-    # Real flight duration
-    start_time = missions.get(mission_id, {}).get("flight_start_time")
-    real_duration_min = 0
-    if start_time:
-        real_duration_min = int((time.time() - start_time) / 60)
+    # Duration and energy now come from MissionBridge (arm→disarm)
+    energy_wh         = bridge_node._final_energy_wh
+    real_duration_min = bridge_node._final_duration_min
+
+    distance_m      = missions.get(mission_id, {}).get("total_distance", 0) or 0
+    real_duration_s = real_duration_min * 60
+    avg_speed       = distance_m / real_duration_s if real_duration_s > 0 else 0
 
     if mission_id in missions:
-        missions[mission_id]["real_energy_wh"]       = energy_wh
-        missions[mission_id]["real_duration_min"]     = real_duration_min
+        missions[mission_id]["real_energy_wh"]   = energy_wh
+        missions[mission_id]["real_duration_min"] = real_duration_min
 
     return {
         "mission_id":         mission_id,
+        "status":             "landed",
         "energy_consumed_wh": round(energy_wh, 2),
         "real_duration_min":  real_duration_min,
         "current_power_w":    round(bridge_node.power_draw_w, 2),
+        "battery_used_pct":   round(100 - bridge_node.battery_remaining_pct, 1),
+        "max_altitude_m":     round(bridge_node._max_altitude, 2),
+        "avg_altitude_m":     round(bridge_node._avg_altitude, 2),
+        "avg_speed_ms":       round(avg_speed, 2),
+        "battery_used_pct":   round(bridge_node._battery_used_pct, 1),
     }
 
 
